@@ -1,0 +1,3 @@
+https://github.com/symfony/swiftmailer-bundle.git swiftmailer-bundle
+https://github.com/symfony/assetic-bundle.git assetic-bundle
+https://github.com/symfony/maker-bundle.git maker-bundle

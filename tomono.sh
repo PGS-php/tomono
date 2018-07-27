@@ -18,49 +18,51 @@ else
 	is_script=false
 fi
 
-# Default name of the mono repository (override with envvar)
+# Name of the mono repository
 : "${MONOREPO_NAME=core}"
 
-# Monorepo directory
-monorepo_dir="$PWD/$MONOREPO_NAME"
-
-
-
-##### FUNCTIONS
-
-# Silent pushd/popd
-pushd () {
-    command pushd "$@" > /dev/null
+# Move all files in every branch in the current working directory's git repo to
+# a subdirectory (as named), including history and tags and everything
+function redir {
+	dirname="${1:?redir requires a subdirectory name to move the files to}"
+	# Temporary directory name---assume this file doesn't exist in the root in
+	# any revision in the entire repo. If it does; probrem.
+	local TEMPF=temp-toDvKEq
+	# -f: Discard backups
+	# --index-filter: Move all files to a subdirectory
+	#    the two grep lines remove all submodules
+	# --tag..: Migrate tags, too
+	# -d: Use a temporary directory, if desired (ramdisk for speed)
+	# --all: All branches and tags and, just, everything. \
+	# NB: The sed expression contains raw tabs---don't remove them
+	# NB: When the post update-index index file is empty, it is not created
+	git filter-branch \
+		${GIT_TMPDIR:+-d "$GIT_TMPDIR"} \
+		--index-filter '
+			git ls-files --stage | \
+			grep -v "^160000" | \
+			grep -v .gitmodules | \
+			sed -e "s_	_	'"$dirname"'/_" | \
+			GIT_INDEX_FILE="$GIT_INDEX_FILE.new" git update-index --index-info && \
+			mv "$GIT_INDEX_FILE.new" "$GIT_INDEX_FILE" || rm "$GIT_INDEX_FILE"' \
+		--tag-name-filter cat \
+		-- \
+		--all
 }
 
-popd () {
-    command popd "$@" > /dev/null
+function create_branches_from_tags {
+    cd $1
+    tags=($(git tag --list))
+    for tag in "${tags[@]}"
+    do
+        tagBranch="release/${tag}"
+        git checkout -f -b "${tagBranch}" "${tag}"
+    done
+    git push --all
 }
 
 function read_repositories {
 	sed -e 's/#.*//' | grep .
-}
-
-# Simply list all files, recursively. No directories.
-function ls-files-recursive {
-	find . -type f | sed -e 's!..!!'
-}
-
-# List all branches for a given remote
-function remote-branches {
-	# With GNU find, this could have been:
-	#
-	#   find "$dir/.git/yada/yada" -type f -printf '%P\n'
-	#
-	# but it's not a real shell script if it's not compatible with a 14th
-	# century OS from planet zorploid borploid.
-
-	# Get into that git plumbing.  Cleanest way to list all branches without
-	# text editing rigmarole (hard to find a safe escape character, as we've
-	# noticed. People will put anything in branch names).
-	pushd "$monorepo_dir/.git/refs/remotes/$1/"
-	ls-files-recursive
-	popd
 }
 
 # Create a monorepository in a directory "core". Read repositories from STDIN:
@@ -75,71 +77,71 @@ function create-mono {
 			echo "--continue specified, but nothing to resume" >&2
 			exit 1
 		fi
-		pushd "$MONOREPO_NAME"
 	else
 		if [[ -d "$MONOREPO_NAME" ]]; then
 			echo "Target repository directory $MONOREPO_NAME already exists." >&2
 			return 1
 		fi
 		mkdir "$MONOREPO_NAME"
-		pushd "$MONOREPO_NAME"
-		git init
+		(
+			cd "$MONOREPO_NAME"
+			git init
+            git config user.name "PGS Bot"
+            git config user.email "bot@pgs-soft.com"
+		)
 	fi
-
-	# This directory will contain all final tag refs (namespaced)
-	mkdir -p .git/refs/namespaced-tags
-
-	read_repositories | while read repo name folder; do
-
+	read_repositories | while read repo name; do
 		if [[ -z "$name" ]]; then
 			echo "pass REPOSITORY NAME pairs on stdin" >&2
 			return 1
-		elif [[ "$name" = */* ]]; then
-			echo "Forward slash '/' not supported in repo names: $name" >&2
-			return 1
 		fi
-
-                if [[ -z "$folder" ]]; then
-			folder="$name"
-                fi
-
 		echo "Merging in $repo.." >&2
-		git remote add "$name" "$repo"
-		echo "Fetching $name.." >&2 
-		git fetch -q "$name"
-
-		# Now we've got all tags in .git/refs/tags: put them away for a sec
-		if [[ -n "$(ls .git/refs/tags)" ]]; then
-			mv .git/refs/tags ".git/refs/namespaced-tags/$name"
-		fi
-
+		rm -rf "$name.git" "$name-tags"
+		git clone -q --bare "$repo" "$name.git"
+		git clone -q "$name.git" "$name-tags"
+		(
+            create_branches_from_tags "$name-tags"
+		)
+		(
+			cd "$name.git"
+			# Rewrite history first
+			redir "$name"
+		)
 		# Merge every branch from the sub repo into the mono repo, into a
 		# branch of the same name (create one if it doesn't exist).
-		remote-branches "$name" | while read branch; do
-			if git rev-parse -q --verify "$branch"; then
-				# Branch already exists, just check it out (and clean up the working dir)
-				git checkout -q "$branch"
-				git checkout -q -- .
-				git clean -f -d
-			else
-				# Create a fresh branch with an empty root commit"
-				git checkout -q --orphan "$branch"
-				# The ignore unmatch is necessary when this was a fresh repo
-				git rm -rfq --ignore-unmatch .
-				git commit -q --allow-empty -m "Root commit for $branch branch"
-			fi
-			git merge -q --no-commit -s ours "$name/$branch" --allow-unrelated-histories
-			git read-tree --prefix="$folder/" "$name/$branch"
-			git commit -q --no-verify --allow-empty -m "Merging $name to $branch"
-		done
+		(
+			cd "$MONOREPO_NAME"
+			git remote add "$name" "../$name.git"
+			git fetch -qa "$name"
+#			# Silly git branch outputs a * in front of the current branch name..
+			git --git-dir ../"$name.git" branch | tr \* ' ' | while read branch; do
+				if git rev-parse -q --verify "$branch"; then
+					# Branch already exists, just check it out (and clean up the working dir)
+					git checkout -q "$branch"
+					git checkout -q -- .
+					git clean -f -d
+				else
+					# Create a fresh branch with an empty root commit"
+					git checkout -q --orphan "$branch"
+					# The ignore unmatch is necessary when this was a fresh repo
+					git rm -rfq --ignore-unmatch .
+					git commit -q --allow-empty -m "Root commit for $branch branch"
+				fi
+				git merge --allow-unrelated-histories -q --no-ff -m "Merging $name to $branch" "$name/$branch"
+			done
+		)
 	done
 
-	# Restore all namespaced tags
-	rm -rf .git/refs/tags
-	mv .git/refs/namespaced-tags .git/refs/tags
+    cd $MONOREPO_NAME;
 
-	git checkout -q master
-	git checkout -q .
+    branches=($(git branch --list | grep release))
+    git tag --list | xargs git tag -d
+
+    for branch in "${branches[@]}"; do
+        tag=$(echo "$branch" |  sed -E 's/([a-z])+\///')
+        git checkout $branch
+        git tag "$tag" -m "Release $tag"
+    done
 }
 
 if [[ "$is_script" == "true" ]]; then
